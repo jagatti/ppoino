@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
-<title>SPゲージ付きリズムゲーム（横画面フィット・判定距離+2px）</title>
+<title>SPゲージ付きリズムゲーム（SP演出込み完全版）</title>
 <style>
   html,body{
     margin:0; padding:0; width:100%; height:100%;
@@ -30,7 +30,7 @@
 const cvs=document.getElementById('game'), ctx=cvs.getContext('2d');
 const rotateMsg=document.getElementById('rotateMsg');
 
-// レイアウト
+// レイアウト・ターゲット
 let R=30;
 let leftTarget={x:0,y:0,r:0}, rightTarget={x:0,y:0,r:0};
 let spRadius=80;
@@ -43,13 +43,24 @@ let score=0, combo=0;
 let notes=[]; // {side:'left'|'right', t, duration, path}
 let frame=0, spawnInterval=60, noteDuration=45;
 
+// SP演出・ブースト
 let spFlashTimer=0, spRingTimer=0, spRingSpeed=20, spRingRange=40;
-let spBoostTimer=0, countdownTimer=0, countdownValue=0;
+let spBoostTimer=0;             // 4秒=240f
+let spCountdownTimer=0;         // 表示タイマー（240f）
+let spCountdownValue=0;         // 3→2→1→0
 
+// 演出
 let popups=[];   // {text,x,y,timer,duration,type:'label'|'score'|'sp'|'flash'}
 let hitRings=[]; // {x,y,r,alpha}
+let lastInputWasTouch=false;
 
-let lastInputWasTouch=false; // 二重発火対策
+// 進行管理
+let gameState = "countdown"; // "countdown" → "playing" → "clear" → "result"
+let countdownValue = 3;      // 開幕カウント
+let totalNotesSpawned = 0;
+const MAX_NOTES = 70;
+let clearStartFrame = null;
+let resultStartFrame = null;
 
 // リサイズ（横画面フィット）
 function resizeCanvas(){
@@ -93,20 +104,156 @@ function makePath(side){
 }
 function spawnNote(side){ notes.push({side,t:0,duration:noteDuration,path:makePath(side)}); }
 
+// ポップアップ・演出
 function addPopup(text,x,y,ms,type){
   const d=Math.max(1,Math.round(ms/16.67));
   popups.push({text,x,y,timer:d,duration:d,type});
 }
 function triggerSPVisual(){ spFlashTimer=10; spRingTimer=spRingSpeed; }
 
+// 判定（+2px：6/10/14/18）
+function calcTapScoreAndLabel(dist){
+  let base=Math.floor(Math.random()*(4000-2500+1))+2500;
+  let label='WONDERFUL', mult=1.2, reset=false;
+  if(dist<=6){label='WONDERFUL';mult=1.2;}
+  else if(dist<=10){label='GREAT';mult=1.1;}
+  else if(dist<=14){label='NICE';mult=1.0;reset=true;}
+  else if(dist<=18){label='BAD';mult=0.9;reset=true;}
+  else {label='MISS';reset=true;}
+  if(label!=='MISS'){
+    base=Math.floor(base*mult);
+    if(Math.random()<0.2){ base=Math.floor(base*1.5); label='CRITICAL'; }
+    if(spBoostTimer>0) base=Math.floor(base*1.1);
+    base=Math.min(5000,base);
+  }else{
+    base=0;
+  }
+  return {points:base,label,reset};
+}
+
+function awardHit(target, points, label, resetCombo){
+  score+=points;
+  if(resetCombo){
+    if(spValue<SP_MAX) spValue=Math.max(0, spValue-300);
+    combo=0;
+  }else combo++;
+  spValue=Math.min(SP_MAX, spValue+200);
+  hitRings.push({x:target.x,y:target.y,r:target.r,alpha:1});
+  addPopup(label,cvs.width/2,cvs.height/2-50,500,'label');
+  addPopup(String(points),cvs.width/2,cvs.height/2-20,500,'score');
+}
+
+function applyMiss(label='MISS'){
+  if(spValue<SP_MAX) spValue=Math.max(0, spValue-300);
+  combo=0;
+  addPopup(label, cvs.width/2, cvs.height/2-50, 500, 'label');
+}
+
+// SP半円内判定
+function isInSPSemicircle(mx,my){
+  const cx=cvs.width/2, cy=cvs.height-10, r=spRadius;
+  const dx=mx-cx, dy=my-cy, dist=Math.hypot(dx,dy);
+  return (dist<=r) && (my<=cy);
+}
+
+// 全画面タップ判定：白○中心基準で最も近いノーツを処理
+function judgeNotesGlobal(){
+  let bestIdx=-1, bestDist=Infinity, bestTarget=null;
+  for(let i=0;i<notes.length;i++){
+    const n=notes[i];
+    const target=n.side==='left'?leftTarget:rightTarget;
+    const pos=cubicBezier(n.path.p0,n.path.p1,n.path.p2,n.path.p3, Math.min(1,n.t/n.duration));
+    const judgeDist=Math.hypot(pos.x-target.x, pos.y-target.y);
+    if(judgeDist<bestDist){
+      bestDist=judgeDist; bestIdx=i; bestTarget=target;
+    }
+  }
+  if(bestIdx>=0){
+    const {points,label,reset}=calcTapScoreAndLabel(bestDist);
+    if(label!=='MISS'){
+      awardHit(bestTarget, points, label, reset);
+      notes.splice(bestIdx,1);
+      return true;
+    }else{
+      return false;
+    }
+  }
+  return false;
+}
+
+// SP発動（満タン時・半円内タップ）
+function tryUseSP(mx,my){
+  if(spValue<SP_MAX) return false;
+  if(!isInSPSemicircle(mx,my)) return false;
+
+  score+=25000;
+  spValue=0;
+
+  // 強演出・カウントダウン復活
+  spRingSpeed=10; spRingRange=80; triggerSPVisual();
+  spBoostTimer=240;               // スコア1.1倍
+  spCountdownTimer=240;           // 4秒表示
+  spCountdownValue=3;             // 3→2→1→0
+  addPopup('25000', cvs.width/2, cvs.height/2, 1000, 'sp');
+  addPopup('', 0, 0, 180, 'flash');
+
+  return true;
+}
+
+// 入力（ゲーム中のみ）
+function handlePointer(e){
+  if(gameState!=="playing") return;
+
+  const isTouch = e.type.startsWith('touch');
+  if(isTouch){ lastInputWasTouch=true; e.preventDefault(); }
+  if(!isTouch && lastInputWasTouch){
+    lastInputWasTouch=false;
+    return;
+  }
+
+  const rect=cvs.getBoundingClientRect();
+  const clientX = isTouch ? e.touches[0].clientX : e.clientX;
+  const clientY = isTouch ? e.touches[0].clientY : e.clientY;
+  const scaleX = cvs.width  / rect.width;
+  const scaleY = cvs.height / rect.height;
+  const mx=(clientX-rect.left)*scaleX;
+  const my=(clientY-rect.top )*scaleY;
+
+  if(isInSPSemicircle(mx,my)){
+    const used=tryUseSP(mx,my);
+    if(!used) applyMiss('MISS');
+    return;
+  }
+
+  if(judgeNotesGlobal()) return;
+  applyMiss('MISS');
+}
+cvs.addEventListener('touchstart',handlePointer,{passive:false});
+cvs.addEventListener('click',handlePointer);
+
 // 更新
 function update(){
   frame++;
 
-  // 出現
-  if(frame%spawnInterval===0) spawnNote(Math.random()<0.5?'left':'right');
+  // 開幕カウントダウン（3→2→1、各1秒表示）
+  if(gameState==="countdown"){
+    if(frame % 60 === 0 && countdownValue>0){
+      countdownValue--;
+      if(countdownValue===0){
+        setTimeout(()=>{ gameState="playing"; },1000); // 最後の「1」を1秒見せてから開始
+      }
+    }
+  }
 
-  // 進行
+  // ノーツ生成（プレイ中のみ・最大70）
+  if(gameState==="playing"){
+    if(totalNotesSpawned < MAX_NOTES && frame % spawnInterval === 0){
+      spawnNote(Math.random()<0.5?'left':'right');
+      totalNotesSpawned++;
+    }
+  }
+
+  // ノーツ進行
   for(const n of notes) n.t++;
 
   // 期限超過→MISS
@@ -117,27 +264,55 @@ function update(){
   }
   notes=keep;
 
-  // SP演出
-  if(spFlashTimer>0) spFlashTimer--;
-  if(spRingTimer >0) spRingTimer--;
+  // 全ノーツ終了→CLEAR→2秒後にRESULT
+  if(gameState==="playing" && totalNotesSpawned>=MAX_NOTES && notes.length===0){
+    gameState="clear";
+    clearStartFrame=frame;
+  }
+  if(gameState==="clear" && frame-clearStartFrame>120){
+    gameState="result";
+    resultStartFrame=frame;
+  }
 
-  // 満タン演出
+  // SP演出・満タン通知（多重防止）
   if(spValue>=SP_MAX){
     if(!spFullNotified){ triggerSPVisual(); spFullNotified=true; }
   }else spFullNotified=false;
 
-  // ブースト・カウントダウン
-  if(spBoostTimer>0){
-    spBoostTimer--;
-    if(countdownTimer>0){
-      countdownTimer--;
-      if(countdownTimer%60===0) countdownValue=Math.max(0,countdownValue-1);
+  // SPカウントダウン表示更新（3→2→1→0）
+  if(spCountdownTimer>0){
+    spCountdownTimer--;
+    if(spCountdownTimer % 60 === 0){
+      spCountdownValue = Math.max(0, spCountdownValue-1);
     }
   }
 
-  // エフェクト寿命
-  hitRings=hitRings.filter(r=>{ r.r+=4; r.alpha-=0.06; return r.alpha>0; });
-  popups  =popups.filter(p=>{ p.timer--; return p.timer>0; });
+  // 汎用演出寿命
+  if(spFlashTimer>0) spFlashTimer--;
+  if(spRingTimer>0)  spRingTimer--;
+  if(spBoostTimer>0) spBoostTimer--;
+  hitRings=hitRings.filter(r=>{r.r+=4; r.alpha-=0.06; return r.alpha>0;});
+  popups=popups.filter(p=>{p.timer--; return p.timer>0;});
+}
+
+// 描画ユーティリティ
+function strokeRainbowText(text,x,y,font){
+  ctx.textAlign='center'; ctx.font=font;
+  const g=ctx.createLinearGradient(x-100,y,x+100,y);
+  const hue=(frame*4)%360;
+  for(let i=0;i<=6;i++) g.addColorStop(i/6,`hsl(${(hue+i*60)%360},100%,50%)`);
+  ctx.lineWidth=4; ctx.strokeStyle=g; ctx.strokeText(text,x,y);
+  ctx.fillStyle='#fff'; ctx.fillText(text,x,y);
+}
+function strokeColoredText(text,x,y,font,color){
+  ctx.textAlign='center'; ctx.font=font;
+  ctx.lineWidth=4; ctx.strokeStyle=color; ctx.strokeText(text,x,y);
+  ctx.fillStyle='#fff'; ctx.fillText(text,x,y);
+}
+function strokeOrangeWhiteText(text,x,y,font){
+  ctx.textAlign='center'; ctx.font=font;
+  ctx.lineWidth=6; ctx.strokeStyle='#fff'; ctx.strokeText(text,x,y);
+  ctx.fillStyle='#ffa500'; ctx.fillText(text,x,y);
 }
 
 // 描画
@@ -161,19 +336,24 @@ function drawHitRings(){
     ctx.beginPath(); ctx.arc(ring.x,ring.y,ring.r,0,Math.PI*2); ctx.stroke();
   }
 }
+
+// SPゲージ（下側半円＋演出）
 function drawSPGauge(){
   const cx=cvs.width/2, cy=cvs.height-10, radius=spRadius;
   const startAngle=Math.PI, endAngle=0;
   ctx.strokeStyle='#fff'; ctx.lineWidth=4;
   ctx.beginPath(); ctx.arc(cx,cy,radius,startAngle,endAngle,false); ctx.stroke();
+
   const fillRatio=Math.min(1, spValue/SP_MAX);
   const fillEnd=startAngle + Math.PI*fillRatio;
   ctx.fillStyle='#fff';
   ctx.beginPath(); ctx.moveTo(cx,cy); ctx.arc(cx,cy,radius,startAngle,fillEnd,false); ctx.closePath(); ctx.fill();
+
   const nx=cx+Math.cos(fillEnd)*(radius-10), ny=cy+Math.sin(fillEnd)*(radius-10);
   ctx.strokeStyle='#fff'; ctx.lineWidth=3;
   ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(nx,ny); ctx.stroke();
   ctx.fillStyle='#fff'; ctx.beginPath(); ctx.arc(cx,cy,Math.max(3, radius*0.06),0,Math.PI*2); ctx.fill();
+
   if(spFlashTimer>0){
     ctx.fillStyle=`rgba(255,255,255,${spFlashTimer/10})`;
     ctx.beginPath(); ctx.moveTo(cx,cy); ctx.arc(cx,cy,radius,startAngle,endAngle,false); ctx.closePath(); ctx.fill();
@@ -186,25 +366,6 @@ function drawSPGauge(){
   }
 }
 
-// テキスト
-function strokeRainbowText(text,x,y,font){
-  ctx.textAlign='center'; ctx.font=font;
-  const g=ctx.createLinearGradient(x-100,y,x+100,y);
-  const hue=(frame*4)%360;
-  for(let i=0;i<=6;i++) g.addColorStop(i/6,`hsl(${(hue+i*60)%360},100%,50%)`);
-  ctx.lineWidth=4; ctx.strokeStyle=g; ctx.strokeText(text,x,y);
-  ctx.fillStyle='#fff'; ctx.fillText(text,x,y);
-}
-function strokeColoredText(text,x,y,font,color){
-  ctx.textAlign='center'; ctx.font=font;
-  ctx.lineWidth=4; ctx.strokeStyle=color; ctx.strokeText(text,x,y);
-  ctx.fillStyle='#fff'; ctx.fillText(text,x,y);
-}
-function strokeOrangeWhiteText(text,x,y,font){
-  ctx.textAlign='center'; ctx.font=font;
-  ctx.lineWidth=6; ctx.strokeStyle='#fff'; ctx.strokeText(text,x,y);
-  ctx.fillStyle='#ffa500'; ctx.fillText(text,x,y);
-}
 function drawPopups(){
   for(const p of popups){
     const a=p.timer/p.duration; ctx.globalAlpha=a;
@@ -217,34 +378,25 @@ function drawPopups(){
       }else if(p.text==='WONDERFUL'){
         strokeRainbowText('WONDERFUL', p.x, p.y, `bold ${Math.max(22,Math.round(R*0.95))}px system-ui`);
       }else if(p.text==='GREAT'){
-        strokeColoredText('GREAT', p.x, p.y, `bold ${Math.max(22,Math.round(R*0.95))}px system-ui`, '#ff69b4'); // ピンク
+        strokeColoredText('GREAT', p.x, p.y, `bold ${Math.max(22,Math.round(R*0.95))}px system-ui`, '#ff69b4');
       }else if(p.text==='NICE'){
-        strokeColoredText('NICE', p.x, p.y, `bold ${Math.max(22,Math.round(R*0.95))}px system-ui`, '#ffd700');  // 黄
+        strokeColoredText('NICE', p.x, p.y, `bold ${Math.max(22,Math.round(R*0.95))}px system-ui`, '#ffd700');
       }else if(p.text==='BAD' || p.text==='MISS'){
-        strokeColoredText(p.text, p.x, p.y, `bold ${Math.max(22,Math.round(R*0.95))}px system-ui`, '#9ca3af');  // グレー
+        strokeColoredText(p.text, p.x, p.y, `bold ${Math.max(22,Math.round(R*0.95))}px system-ui`, '#9ca3af');
       }
     }else if(p.type==='score'){
       strokeColoredText(p.text, p.x, p.y, `bold ${Math.max(18,Math.round(R*0.85))}px system-ui`, '#39ff14');
     }else if(p.type==='sp'){
       strokeOrangeWhiteText(p.text, p.x, p.y, `bold ${Math.max(30,Math.round(R*1.6))}px system-ui`);
+    }else if(p.type==='flash'){
+      // 全画面フラッシュは drawOverlays で処理
     }
     ctx.globalAlpha=1;
   }
 }
-function drawCountdown(){
-  if(countdownTimer<=0) return;
-  const x=cvs.width/2, y=Math.round(cvs.height*0.25);
-  if(countdownValue===0 && Math.floor(frame/8)%2===0) return;
-  ctx.textAlign='center'; ctx.font=`bold ${Math.max(64,Math.round(R*3.2))}px system-ui`; ctx.globalAlpha=0.7;
-  const g=ctx.createLinearGradient(x-100,y,x+100,y);
-  const hue=(frame*4)%360;
-  for(let i=0;i<=6;i++) g.addColorStop(i/6, `hsl(${(hue+i*60)%360},100%,50%)`);
-  ctx.lineWidth=8; ctx.strokeStyle='#fff'; ctx.strokeText(countdownValue, x, y);
-  ctx.lineWidth=4; ctx.strokeStyle=g;      ctx.strokeText(countdownValue, x, y);
-  ctx.fillStyle='rgba(255,255,255,0.5)';   ctx.fillText(countdownValue, x, y);
-  ctx.globalAlpha=1;
-}
+
 function drawUI(){
+  if(gameState!=="playing") return;
   const cx=cvs.width - Math.max(40, Math.round(R*1.8));
   ctx.textAlign='center'; ctx.fillStyle='#fff';
   ctx.font=`bold ${Math.max(28,Math.round(R*1.4))}px system-ui`; ctx.fillText(`${combo}`, cx, Math.max(30,Math.round(R*1.4)));
@@ -252,6 +404,7 @@ function drawUI(){
   ctx.textAlign='right'; ctx.font=`bold ${Math.max(16,Math.round(R*0.9))}px system-ui`;
   ctx.fillText(`Score: ${score}`, cvs.width-12, cvs.height-16);
 }
+
 function drawOverlays(){
   const f=popups.find(p=>p.type==='flash');
   if(f){
@@ -260,141 +413,84 @@ function drawOverlays(){
   }
 }
 
+// SPカウントダウン表示（ブースト中：中央に3→2→1→0、虹色縁取り）
+function drawSPCountdown(){
+  if(spCountdownTimer<=0) return;
+  // 0は高速点滅（8フレーム周期）
+  if(spCountdownValue===0 && Math.floor(frame/8)%2===0) return;
+
+  const x=cvs.width/2, y=Math.round(cvs.height*0.25);
+  ctx.textAlign='center';
+  ctx.font=`bold ${Math.max(64,Math.round(R*3.2))}px system-ui`;
+  // 虹色ストローク
+  const g=ctx.createLinearGradient(x-100,y,x+100,y);
+  const hue=(frame*4)%360;
+  for(let i=0;i<=6;i++) g.addColorStop(i/6, `hsl(${(hue+i*60)%360},100%,50%)`);
+  ctx.lineWidth=8; ctx.strokeStyle=g; ctx.strokeText(spCountdownValue, x, y);
+  ctx.fillStyle='rgba(255,255,255,0.85)'; ctx.fillText(spCountdownValue, x, y);
+}
+
 function render(){
   ctx.clearRect(0,0,cvs.width,cvs.height);
+
+  // フィールド
   drawTargets();
   drawNotes();
   drawHitRings();
   drawSPGauge();
   drawPopups();
   drawUI();
-  drawCountdown();
   drawOverlays();
+
+  // 開幕カウントダウン（白文字＋黒縁）
+  if(gameState==="countdown"){
+    const txt = countdownValue>0 ? countdownValue : 1;
+    ctx.textAlign='center';
+    ctx.font=`bold ${Math.round(cvs.height*0.3)}px system-ui`;
+    ctx.lineWidth=10; ctx.strokeStyle='#000'; ctx.strokeText(txt, cvs.width/2, cvs.height/2);
+    ctx.fillStyle='#fff'; ctx.fillText(txt, cvs.width/2, cvs.height/2);
+    return;
+  }
+
+  // SPカウントダウン（常時オーバーレイ）
+  drawSPCountdown();
+
+  // CLEAR
+  if(gameState==="clear"){
+    ctx.textAlign='center';
+    ctx.font=`bold ${Math.round(cvs.height*0.18)}px system-ui`;
+    ctx.lineWidth=10; ctx.strokeStyle='#fff'; ctx.strokeText('CLEAR', cvs.width/2, cvs.height/2);
+    ctx.fillStyle='#ffa500'; ctx.fillText('CLEAR', cvs.width/2, cvs.height/2);
+    return;
+  }
+
+  // 結果画面（スコア演出）
+  if(gameState==="result"){
+    const t = Math.min(1, (frame - (resultStartFrame||frame)) / 60);
+    const scale = 0.8 + 0.2*Math.sin(t*Math.PI/2);
+    const alpha = 0.5 + 0.5*t;
+    ctx.save();
+    ctx.translate(cvs.width/2, cvs.height/2);
+    ctx.scale(scale, scale);
+    ctx.textAlign='center';
+    ctx.shadowColor='rgba(255,165,0,0.6)';
+    ctx.shadowBlur=40*alpha;
+
+    ctx.globalAlpha=alpha;
+    ctx.font=`bold ${Math.round(cvs.height*0.12)}px system-ui`;
+    ctx.lineWidth=8; ctx.strokeStyle='#000'; ctx.strokeText('RESULT', 0, -80);
+    ctx.fillStyle='#ffa500'; ctx.fillText('RESULT', 0, -80);
+
+    ctx.font=`bold ${Math.round(cvs.height*0.16)}px system-ui`;
+    ctx.lineWidth=10; ctx.strokeStyle='#000'; ctx.strokeText(`SCORE: ${score}`, 0, 70);
+    ctx.fillStyle='#39ff14'; ctx.fillText(`SCORE: ${score}`, 0, 70);
+    ctx.restore();
+    return;
+  }
 }
 
+// ループ
 function loop(){ update(); render(); requestAnimationFrame(loop); }
-
-// 判定計算（+2px：6/10/14/18）
-function calcTapScoreAndLabel(dist){
-  let base=Math.floor(Math.random()*(4000-2500+1))+2500;
-  let label='WONDERFUL', mult=1.2, reset=false;
-  if(dist<=6){label='WONDERFUL';mult=1.2;}
-  else if(dist<=10){label='GREAT';mult=1.1;}
-  else if(dist<=14){label='NICE';mult=1.0;reset=true;}
-  else if(dist<=18){label='BAD';mult=0.9;reset=true;}
-  else {label='MISS';reset=true;}
-  if(label!=='MISS'){
-    base=Math.floor(base*mult);
-    if(Math.random()<0.2){ base=Math.floor(base*1.5); label='CRITICAL'; }
-    if(spBoostTimer>0) base=Math.floor(base*1.1);
-    base=Math.min(5000,base);
-  }else{
-    base=0;
-  }
-  return {points:base,label,reset};
-}
-
-// ヒット適用
-function awardHit(target, points, label, resetCombo){
-  score+=points;
-  if(resetCombo){
-    if(spValue<SP_MAX) spValue=Math.max(0, spValue-300);
-    combo=0;
-  }else{
-    combo+=1;
-  }
-  spValue=Math.min(SP_MAX, spValue+200);
-  hitRings.push({x:target.x,y:target.y,r:target.r,alpha:1});
-  const midX=(leftTarget.x+rightTarget.x)/2;
-  const labelY=(leftTarget.y+rightTarget.y)/2 - Math.max(40, Math.round(R*1.6));
-  const scoreY=(leftTarget.y+rightTarget.y)/2 - Math.max(16, Math.round(R*0.8));
-  addPopup(label, midX, labelY, 500, 'label');
-  addPopup(String(points), midX, scoreY, 500, 'score');
-}
-
-// MISS適用（BAD超や未タップ）
-function applyMiss(label='MISS'){
-  if(spValue<SP_MAX) spValue=Math.max(0, spValue-300);
-  combo=0;
-  const midX=(leftTarget.x+rightTarget.x)/2;
-  const labelY=(leftTarget.y+rightTarget.y)/2 - Math.max(40, Math.round(R*1.6));
-  addPopup(label, midX, labelY, 500, 'label');
-}
-
-// SP半円内判定
-function isInSPSemicircle(mx,my){
-  const cx=cvs.width/2, cy=cvs.height-10, r=spRadius;
-  const dx=mx-cx, dy=my-cy, dist=Math.hypot(dx,dy);
-  return (dist<=r) && (my<=cy);
-}
-
-// 全画面タップ判定：白○中心基準で最も近いノーツを処理
-function judgeNotesGlobal(){
-  let bestIdx=-1, bestDist=Infinity, bestTarget=null;
-  for(let i=0;i<notes.length;i++){
-    const n=notes[i];
-    const target=n.side==='left'?leftTarget:rightTarget;
-    const pos=cubicBezier(n.path.p0,n.path.p1,n.path.p2,n.path.p3, Math.min(1,n.t/n.duration));
-    const judgeDist=Math.hypot(pos.x-target.x, pos.y-target.y);
-    if(judgeDist<bestDist){ bestDist=judgeDist; bestIdx=i; bestTarget=target; }
-  }
-  if(bestIdx>=0){
-    const {points,label,reset}=calcTapScoreAndLabel(bestDist);
-    if(label!=='MISS'){
-      awardHit(bestTarget, points, label, reset);
-      notes.splice(bestIdx,1);
-      return true;
-    }else{
-      return false; // MISSは呼び元で
-    }
-  }
-  return false;
-}
-
-// SP発動（半円内タップ・満タン時）
-function tryUseSP(mx,my){
-  if(spValue<SP_MAX) return false;
-  if(!isInSPSemicircle(mx,my)) return false;
-  score+=25000; spValue=0;
-  spRingSpeed=10; spRingRange=80; triggerSPVisual();
-  spBoostTimer=240; countdownTimer=240; countdownValue=3;
-  addPopup('25000', cvs.width/2, cvs.height/2, 1000, 'sp');
-  addPopup('', 0, 0, 180, 'flash');
-  return true;
-}
-
-// 入力（タッチ/クリック）二重発火防止＋ヒット時はMISSを出さない
-function handlePointer(e){
-  const isTouch = e.type.startsWith('touch');
-  if(isTouch){ lastInputWasTouch=true; e.preventDefault(); }
-  if(!isTouch && lastInputWasTouch){
-    // 直前にtouchが来ていれば、同一操作由来のclickを無視
-    lastInputWasTouch=false;
-    return;
-  }
-
-  const rect=cvs.getBoundingClientRect();
-  const clientX = isTouch ? e.touches[0].clientX : e.clientX;
-  const clientY = isTouch ? e.touches[0].clientY : e.clientY;
-  const scaleX = cvs.width  / rect.width;
-  const scaleY = cvs.height / rect.height;
-  const mx=(clientX-rect.left)*scaleX;
-  const my=(clientY-rect.top )*scaleY;
-
-  if(isInSPSemicircle(mx,my)){
-    const used=tryUseSP(mx,my);
-    if(!used) applyMiss('MISS');
-    return;
-  }
-
-  if(judgeNotesGlobal()) return; // ヒットしたらここで終了
-  applyMiss('MISS'); // BAD超
-}
-
-cvs.addEventListener('touchstart',handlePointer,{passive:false});
-cvs.addEventListener('click',handlePointer);
-
-// ループ開始
 (function start(){ loop(); })();
 </script>
 </body>
