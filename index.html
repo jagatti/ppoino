@@ -1,9 +1,10 @@
+
 <!doctype html>
 <html lang="ja">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
-<title>SPゲージ付きリズムゲーム（SP演出込み完全版）</title>
+<title>SPゲージ付きリズムゲーム（特技履歴＋SP抽選＋進捗バー改）</title>
 <style>
   html,body{
     margin:0; padding:0; width:100%; height:100%;
@@ -46,7 +47,7 @@ let frame=0, spawnInterval=60, noteDuration=45;
 // SP演出・ブースト
 let spFlashTimer=0, spRingTimer=0, spRingSpeed=20, spRingRange=40;
 let spBoostTimer=0;             // 4秒=240f
-let spCountdownTimer=0;         // 表示タイマー（240f）
+let spCountdownTimer=0;         // SP演出表示タイマー（240f）
 let spCountdownValue=0;         // 3→2→1→0
 
 // 演出
@@ -62,6 +63,15 @@ const MAX_NOTES = 70;
 let clearStartFrame = null;
 let resultStartFrame = null;
 
+// 特技履歴・アピール増加・回数カウント
+let skillHistory = []; // {text, life}
+let appealBoostNotes = 0; // 残りノーツ数（次のnノーツで基本スコア×1.12切り上げ適用）
+let skillActivationCount = 0; // 特技発動回数（タップ30%抽選で当たった回数）
+let spUseCount = 0;           // SP使用回数
+
+// 進捗バー（シームレス表示用）
+let progressDisplay = 0; // 補間用 0..1
+
 // リサイズ（横画面フィット）
 function resizeCanvas(){
   const landscape = window.innerWidth >= window.innerHeight;
@@ -72,7 +82,6 @@ function resizeCanvas(){
   }
   rotateMsg.style.display='none';
   cvs.style.display='block';
-
   cvs.width = window.innerWidth;
   cvs.height= window.innerHeight;
 
@@ -112,26 +121,32 @@ function addPopup(text,x,y,ms,type){
 function triggerSPVisual(){ spFlashTimer=10; spRingTimer=spRingSpeed; }
 
 // 判定（+2px：6/10/14/18）
-function calcTapScoreAndLabel(dist){
-  let base=Math.floor(Math.random()*(4000-2500+1))+2500;
-  let label='WONDERFUL', mult=1.2, reset=false;
+// baseRaw: 基本スコア（距離倍率前。アピール増加適用後、CRITICAL/SP倍率前）
+function calcTapBase(){
+  let baseRaw=Math.floor(Math.random()*(4000-2500+1))+2500;
+  if(appealBoostNotes>0){
+    baseRaw = Math.ceil(baseRaw * 1.12);
+    appealBoostNotes--;
+  }
+  return baseRaw;
+}
+function calcTapScoreAndLabel(dist, baseRaw){
+  let label='WONDERFUL', mult=1.2;
   if(dist<=6){label='WONDERFUL';mult=1.2;}
   else if(dist<=10){label='GREAT';mult=1.1;}
-  else if(dist<=14){label='NICE';mult=1.0;reset=true;}
-  else if(dist<=18){label='BAD';mult=0.9;reset=true;}
-  else {label='MISS';reset=true;}
-  if(label!=='MISS'){
-    base=Math.floor(base*mult);
-    if(Math.random()<0.2){ base=Math.floor(base*1.5); label='CRITICAL'; }
-    if(spBoostTimer>0) base=Math.floor(base*1.1);
-    base=Math.min(5000,base);
-  }else{
-    base=0;
-  }
-  return {points:base,label,reset};
+  else if(dist<=14){label='NICE';mult=1.0;}
+  else if(dist<=18){label='BAD';mult=0.9;}
+  else {return {points:0,label:'MISS',reset:true};}
+
+  let points=Math.floor(baseRaw*mult);
+  if(Math.random()<0.2){ points=Math.floor(points*1.5); label='CRITICAL'; }
+  if(spBoostTimer>0) points=Math.floor(points*1.1);
+  points=Math.min(5000, points);
+  const reset = (label==='NICE' || label==='BAD');
+  return {points,label,reset};
 }
 
-function awardHit(target, points, label, resetCombo){
+function awardHit(target, points, label, resetCombo, baseRaw){
   score+=points;
   if(resetCombo){
     if(spValue<SP_MAX) spValue=Math.max(0, spValue-300);
@@ -139,14 +154,40 @@ function awardHit(target, points, label, resetCombo){
   }else combo++;
   spValue=Math.min(SP_MAX, spValue+200);
   hitRings.push({x:target.x,y:target.y,r:target.r,alpha:1});
-  addPopup(label,cvs.width/2,cvs.height/2-50,500,'label');
-  addPopup(String(points),cvs.width/2,cvs.height/2-20,500,'score');
+
+  // スコア表示位置：左右ターゲットの中間より少し上
+  const midX = (leftTarget.x + rightTarget.x) / 2;
+  const midY = (leftTarget.y + rightTarget.y) / 2 - R*2;
+  addPopup(label, midX, midY - 30, 500, 'label');
+  addPopup(String(points), midX, midY, 500, 'score');
+
+  // 特技発動判定（30%）
+  if(Math.random() < 0.3){
+    skillActivationCount++;
+    const skillType = Math.floor(Math.random()*3);
+    if(skillType===0){
+      // ボルテージ獲得：その時のタップ基本スコアを追加
+      score += baseRaw;
+      skillHistory.unshift({text:`[ボルテージ獲得 ${baseRaw}]`, life:180});
+    }else if(skillType===1){
+      // SPゲージ獲得：9% = 540
+      spValue = Math.min(SP_MAX, spValue+540);
+      skillHistory.unshift({text:`[SPゲージ獲得 9%]`, life:180});
+    }else{
+      // アピール増加：次の5ノーツ 1.12倍（切り上げ）
+      appealBoostNotes = 5;
+      skillHistory.unshift({text:`[アピール増加 12%]`, life:180});
+    }
+    if(skillHistory.length>5) skillHistory.pop();
+  }
 }
 
 function applyMiss(label='MISS'){
   if(spValue<SP_MAX) spValue=Math.max(0, spValue-300);
   combo=0;
-  addPopup(label, cvs.width/2, cvs.height/2-50, 500, 'label');
+  const midX = (leftTarget.x + rightTarget.x) / 2;
+  const midY = (leftTarget.y + rightTarget.y) / 2 - R*2;
+  addPopup(label, midX, midY - 30, 500, 'label');
 }
 
 // SP半円内判定
@@ -169,9 +210,10 @@ function judgeNotesGlobal(){
     }
   }
   if(bestIdx>=0){
-    const {points,label,reset}=calcTapScoreAndLabel(bestDist);
+    const baseRaw = calcTapBase();
+    const {points,label,reset}=calcTapScoreAndLabel(bestDist, baseRaw);
     if(label!=='MISS'){
-      awardHit(bestTarget, points, label, reset);
+      awardHit(bestTarget, points, label, reset, baseRaw);
       notes.splice(bestIdx,1);
       return true;
     }else{
@@ -186,16 +228,28 @@ function tryUseSP(mx,my){
   if(spValue<SP_MAX) return false;
   if(!isInSPSemicircle(mx,my)) return false;
 
+  spUseCount++; // 使用回数カウント
   score+=25000;
   spValue=0;
 
-  // 強演出・カウントダウン復活
+  // 強演出・カウントダウン
   spRingSpeed=10; spRingRange=80; triggerSPVisual();
   spBoostTimer=240;               // スコア1.1倍
   spCountdownTimer=240;           // 4秒表示
   spCountdownValue=3;             // 3→2→1→0
   addPopup('25000', cvs.width/2, cvs.height/2, 1000, 'sp');
   addPopup('', 0, 0, 180, 'flash');
+
+  // 追加抽選：6回、30%で600獲得（成功毎に履歴に[SPゲージ獲得]）
+  let successes=0;
+  for(let i=0;i<6;i++){
+    if(Math.random()<0.3){
+      successes++;
+      spValue = Math.min(SP_MAX, spValue + 600);
+      skillHistory.unshift({text:`[SPゲージ獲得]`, life:180});
+      if(skillHistory.length>5) skillHistory.pop();
+    }
+  }
 
   return true;
 }
@@ -287,6 +341,15 @@ function update(){
     }
   }
 
+  // 進捗バー（シームレス補間）
+  const clearedNotes = totalNotesSpawned - notes.length;
+  const targetProgress = Math.min(1, clearedNotes / MAX_NOTES);
+  progressDisplay += (targetProgress - progressDisplay) * 0.2; // LERP
+
+  // 特技履歴寿命
+  skillHistory.forEach(h=>h.life--);
+  skillHistory = skillHistory.filter(h=>h.life>0);
+
   // 汎用演出寿命
   if(spFlashTimer>0) spFlashTimer--;
   if(spRingTimer>0)  spRingTimer--;
@@ -313,6 +376,61 @@ function strokeOrangeWhiteText(text,x,y,font){
   ctx.textAlign='center'; ctx.font=font;
   ctx.lineWidth=6; ctx.strokeStyle='#fff'; ctx.strokeText(text,x,y);
   ctx.fillStyle='#ffa500'; ctx.fillText(text,x,y);
+}
+
+// 進捗バー（上部・短め・水色・シームレス）
+function drawProgressBar(){
+  const barMarginLeft = 20;
+  const barMarginRight = 200; // 右上コンボと被らないように広めの余白
+  const barWidth = Math.max(140, cvs.width - barMarginLeft - barMarginRight);
+  const barHeight = 12;
+  const x = barMarginLeft;
+  const y = 10;
+
+  // 背景
+  ctx.fillStyle = '#4b5563';
+  ctx.fillRect(x, y, barWidth, barHeight);
+
+  // シームレス進行（水色）
+  ctx.fillStyle = '#00e5ff';
+  ctx.fillRect(x, y, barWidth * progressDisplay, barHeight);
+
+  // 枠線
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(x, y, barWidth, barHeight);
+}
+
+// 特技履歴（画面の下のほうに最大5件、上から下へ）
+function drawSkillHistory(){
+  const maxItems = 5;
+  const lineH = Math.max(22, Math.round(R*0.9));
+  const padding = 12;
+  // 5件がちょうど収まる高さから開始（下マージン20）
+  const startY = cvs.height - 20 - (maxItems-1)*lineH;
+  const x = 20;
+
+  ctx.textAlign='left';
+  ctx.font=`bold ${lineH}px system-ui`;
+
+  const items = skillHistory.slice(0, maxItems);
+  for(let i=0;i<items.length;i++){
+    const h=items[i];
+    let alpha = 1;
+    if(h.life < 30) alpha = h.life/30;
+    ctx.globalAlpha = alpha;
+
+    const text = h.text;
+    const w = ctx.measureText(text).width;
+    // 背景パネル
+    ctx.fillStyle='rgba(0,0,0,0.35)';
+    ctx.fillRect(x-8, startY + i*lineH - (lineH- padding/2), w+16, lineH+padding/2);
+    // 文字（やや水色がかった白）
+    ctx.fillStyle='#e5faff';
+    ctx.fillText(text, x, startY + i*lineH);
+
+    ctx.globalAlpha = 1;
+  }
 }
 
 // 描画
@@ -388,8 +506,6 @@ function drawPopups(){
       strokeColoredText(p.text, p.x, p.y, `bold ${Math.max(18,Math.round(R*0.85))}px system-ui`, '#39ff14');
     }else if(p.type==='sp'){
       strokeOrangeWhiteText(p.text, p.x, p.y, `bold ${Math.max(30,Math.round(R*1.6))}px system-ui`);
-    }else if(p.type==='flash'){
-      // 全画面フラッシュは drawOverlays で処理
     }
     ctx.globalAlpha=1;
   }
@@ -413,23 +529,22 @@ function drawOverlays(){
   }
 }
 
-// SPカウントダウン表示（ブースト中：中央に3→2→1→0、虹色縁取り）
+// SPカウントダウン表示（ブースト中：中央に3→2→1→0、0は点滅）
 function drawSPCountdown(){
   if(spCountdownTimer<=0) return;
-  // 0は高速点滅（8フレーム周期）
   if(spCountdownValue===0 && Math.floor(frame/8)%2===0) return;
 
   const x=cvs.width/2, y=Math.round(cvs.height*0.25);
   ctx.textAlign='center';
   ctx.font=`bold ${Math.max(64,Math.round(R*3.2))}px system-ui`;
-  // 虹色ストローク
   const g=ctx.createLinearGradient(x-100,y,x+100,y);
   const hue=(frame*4)%360;
   for(let i=0;i<=6;i++) g.addColorStop(i/6, `hsl(${(hue+i*60)%360},100%,50%)`);
   ctx.lineWidth=8; ctx.strokeStyle=g; ctx.strokeText(spCountdownValue, x, y);
-  ctx.fillStyle='rgba(255,255,255,0.85)'; ctx.fillText(spCountdownValue, x, y);
+  ctx.fillStyle='rgba(255,255,255,0.9)'; ctx.fillText(spCountdownValue, x, y);
 }
 
+// メイン描画
 function render(){
   ctx.clearRect(0,0,cvs.width,cvs.height);
 
@@ -441,6 +556,12 @@ function render(){
   drawPopups();
   drawUI();
   drawOverlays();
+
+  // 進捗バー（上部）
+  drawProgressBar();
+
+  // 特技履歴（下部に5件）
+  drawSkillHistory();
 
   // 開幕カウントダウン（白文字＋黒縁）
   if(gameState==="countdown"){
@@ -464,7 +585,7 @@ function render(){
     return;
   }
 
-  // 結果画面（スコア演出）
+  // 結果画面（スコア＋特技発動回数＋SP使用回数）
   if(gameState==="result"){
     const t = Math.min(1, (frame - (resultStartFrame||frame)) / 60);
     const scale = 0.8 + 0.2*Math.sin(t*Math.PI/2);
@@ -478,12 +599,22 @@ function render(){
 
     ctx.globalAlpha=alpha;
     ctx.font=`bold ${Math.round(cvs.height*0.12)}px system-ui`;
-    ctx.lineWidth=8; ctx.strokeStyle='#000'; ctx.strokeText('RESULT', 0, -80);
-    ctx.fillStyle='#ffa500'; ctx.fillText('RESULT', 0, -80);
+    ctx.lineWidth=8; ctx.strokeStyle='#000'; ctx.strokeText('RESULT', 0, -120);
+    ctx.fillStyle='#ffa500'; ctx.fillText('RESULT', 0, -120);
 
-    ctx.font=`bold ${Math.round(cvs.height*0.16)}px system-ui`;
-    ctx.lineWidth=10; ctx.strokeStyle='#000'; ctx.strokeText(`SCORE: ${score}`, 0, 70);
-    ctx.fillStyle='#39ff14'; ctx.fillText(`SCORE: ${score}`, 0, 70);
+    ctx.font=`bold ${Math.round(cvs.height*0.12)}px system-ui`;
+    ctx.lineWidth=10; ctx.strokeStyle='#000'; ctx.strokeText(`SCORE: ${score}`, 0, 0);
+    ctx.fillStyle='#39ff14'; ctx.fillText(`SCORE: ${score}`, 0, 0);
+
+    // 追加情報
+    ctx.font=`bold ${Math.round(cvs.height*0.06)}px system-ui`;
+    ctx.lineWidth=6; ctx.strokeStyle='#000';
+    ctx.strokeText(`特技発動回数: ${skillActivationCount}`, 0, 80);
+    ctx.strokeText(`SP使用回数: ${spUseCount}`, 0, 130);
+    ctx.fillStyle='#e5faff';
+    ctx.fillText(`特技発動回数: ${skillActivationCount}`, 0, 80);
+    ctx.fillText(`SP使用回数: ${spUseCount}`, 0, 130);
+
     ctx.restore();
     return;
   }
